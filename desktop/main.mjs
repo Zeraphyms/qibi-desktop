@@ -154,6 +154,25 @@ function startCloudflareTunnel(port) {
 
 let runningDataDir = "";
 
+// 会话密钥持久化：API Key 等敏感字段用 SESSION_SECRET 派生的 AES-GCM 加密落库，
+// 若每次启动都随机生成，重启后已保存的密钥将永远无法解密（decryptKey 静默返回 null）。
+// 因此首次启动生成一次并写入数据目录，之后固定复用；环境变量显式指定的优先。
+function resolveSessionSecret(dataDir) {
+  if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.trim()) {
+    return process.env.SESSION_SECRET.trim();
+  }
+  const secretFile = path.join(dataDir, ".session-secret");
+  try {
+    const existing = fs.readFileSync(secretFile, "utf8").trim();
+    if (existing) return existing;
+  } catch {
+    /* 不存在则首次生成 */
+  }
+  const secret = crypto.randomBytes(32).toString("hex");
+  fs.writeFileSync(secretFile, secret, { encoding: "utf8", mode: 0o600 });
+  return secret;
+}
+
 function resolveServerDataDir() {
   if (process.env.DATA_DIR && process.env.DATA_DIR.trim()) {
     return process.env.DATA_DIR.trim();
@@ -191,9 +210,7 @@ async function runAsPublicServer() {
   process.env.NODE_ENV = "production";
   process.env.DATA_DIR = dataDir;
   process.env.WEB_DIST = path.join(here, "web-dist");
-  if (!process.env.SESSION_SECRET) {
-    process.env.SESSION_SECRET = crypto.randomBytes(32).toString("hex");
-  }
+  process.env.SESSION_SECRET = resolveSessionSecret(dataDir);
 
   await import("./server-bundle.mjs");
   const ok = await waitForHealth(runningPort);
@@ -249,9 +266,7 @@ async function runAsStandaloneClient() {
   process.env.NODE_ENV = "production";
   process.env.DATA_DIR = dataDir;
   process.env.WEB_DIST = path.join(here, "web-dist");
-  if (!process.env.SESSION_SECRET) {
-    process.env.SESSION_SECRET = crypto.randomBytes(32).toString("hex");
-  }
+  process.env.SESSION_SECRET = resolveSessionSecret(dataDir);
 
   await import("./server-bundle.mjs");
   const ok = await waitForHealth(port);
