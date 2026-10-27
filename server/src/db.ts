@@ -341,6 +341,34 @@ if (!novelColumns.some((c) => c.name === "is_public")) {
   db.exec("ALTER TABLE novels ADD COLUMN is_public INTEGER NOT NULL DEFAULT 1");
 }
 
+// 角色动态账本 v2 扩展列：此前只存在于 scripts/upgrade_* 手动迁移脚本（依赖未安装的 better-sqlite3），
+// 新库/便携版用户启动即缺列，导致 Agent 工具链（update_character_state）与
+// AI 批量导入（routes/characters.ts）写入 character_states 时抛 no such column。
+// 这里按同样的结构做启动期幂等迁移，三个脚本随之废弃。
+const stateColumns = db.prepare("PRAGMA table_info(character_states)").all() as Array<{ name: string }>;
+for (const col of [
+  { name: "key_relationships", ddl: "ALTER TABLE character_states ADD COLUMN key_relationships TEXT NOT NULL DEFAULT ''" },
+  { name: "recent_events", ddl: "ALTER TABLE character_states ADD COLUMN recent_events TEXT NOT NULL DEFAULT ''" },
+  { name: "type_specific_data", ddl: "ALTER TABLE character_states ADD COLUMN type_specific_data TEXT NOT NULL DEFAULT '{}'" },
+]) {
+  if (!stateColumns.some((c) => c.name === col.name)) {
+    db.exec(col.ddl);
+  }
+}
+
+// 旧数据归档：把 v1 修仙字段迁入 type_specific_data(JSON)，与 upgrade 脚本的历史行为保持一致
+const legacyStates = db
+  .prepare(
+    "SELECT character_id, current_realm, inventory, status_effects FROM character_states WHERE (current_realm != '' OR inventory != '' OR status_effects != '') AND (type_specific_data = '{}' OR type_specific_data IS NULL)"
+  )
+  .all() as Array<{ character_id: number; current_realm: string; inventory: string; status_effects: string }>;
+if (legacyStates.length > 0) {
+  const backfill = db.prepare("UPDATE character_states SET type_specific_data = ? WHERE character_id = ?");
+  for (const s of legacyStates) {
+    backfill.run(JSON.stringify({ realm: s.current_realm, inventory: s.inventory, status_effects: s.status_effects }), s.character_id);
+  }
+}
+
 // ---- helpers ----
 export function now(): string {
   return new Date().toISOString();
