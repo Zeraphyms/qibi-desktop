@@ -13,9 +13,8 @@ import { listAllExternalTools, callTool as callExternalTool } from "./mcpClient.
 import { indexOne, query as kbQuery, indexNovel as kbIndexNovel, kbStats as kbGetStats } from "./kb.js";
 import { streamChat } from "./routes/ai.js";
 
-// Agent runtime config, injected by the agent router at call time
-let _agentRuntimeConfig: { key: string; protocol: string; baseUrl: string; model: string } | null = null;
-export function setAgentRuntimeConfig(cfg: typeof _agentRuntimeConfig) { _agentRuntimeConfig = cfg; }
+// Agent runtime config：逐请求透传（进程内全局单例会让并发用户的密钥/端点互相覆盖）
+export type AgentRuntimeConfig = { key: string; protocol: string; baseUrl: string; model: string };
 
 export type AgentToolSpec = {
   name: string;
@@ -317,7 +316,8 @@ export function listAllTools(ownerId: number, includeExternal: boolean): AgentTo
 export async function dispatchAgentTool(
   ownerId: number,
   name: string,
-  args: any
+  args: any,
+  runtimeConfig?: AgentRuntimeConfig
 ): Promise<any> {
   if (name.startsWith("ext:")) {
     const [, clientId, ...rest] = name.split(":");
@@ -545,7 +545,7 @@ export async function dispatchAgentTool(
       return { ok: true, character: db.prepare("SELECT * FROM characters WHERE id = ?").get(a.characterId) };
     }
     case "ai_draft": {
-      if (!_agentRuntimeConfig) throw new Error("Agent 写作引擎未初始化，请重试或检查 API 配置");
+      if (!runtimeConfig) throw new Error("Agent 写作引擎未初始化，请重试或检查 API 配置");
       const chapter = db.prepare("SELECT * FROM chapters WHERE id = ?").get(a.chapterId) as any;
       if (!chapter) throw new Error("章节不存在");
       const novel = db.prepare("SELECT user_id FROM novels WHERE id = ?").get(a.novelId) as any;
@@ -588,7 +588,7 @@ export async function dispatchAgentTool(
       if (a.extra) contextParts.push(`【附加要求】\n${a.extra}`);
       const context = contextParts.join("\n\n");
       let generated = "";
-      const rc = _agentRuntimeConfig;
+      const rc = runtimeConfig;
       await streamChat({
         key: rc.key,
         system: systemPrompt,

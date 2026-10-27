@@ -26,6 +26,7 @@ backups/
 .env.*
 *.env
 server/.env
+.session-secret
 
 # Logs and runtime traces
 logs/
