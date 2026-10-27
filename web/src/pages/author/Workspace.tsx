@@ -9,9 +9,8 @@ import {
   History, Undo2, Copy, Scissors, Clock, Check, BookOpen, FileText, Globe, Lock, Terminal, PlayCircle,
   Bookmark, Search, Bell,
 } from "lucide-react";
-import { chapterRevisionApi } from "../../api";
+import { api, aiStream, ApiError, readSseEvents, skillAuthorApi, ssePost, writerStateApi, chapterRevisionApi } from "../../api";
 import type { ChapterRevision } from "../../types";
-import { api, aiStream, ApiError, skillAuthorApi, writerStateApi } from "../../api";
 import { PromptDialog } from "../../components/Dialog";
 import type { Chapter, Character, DistilledAuthor, Novel, NovelWriterState, Outline } from "../../types";
 
@@ -1143,49 +1142,22 @@ const isReportMode = aiMode === "review" || aiMode === "analyze" || aiMode === "
     setAgentBusy(true);
     setAgentLog([]);
     try {
-      const res = await fetch("/api/agent/run", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ task: agentTask.trim(), novelId, includeExternal: agentIncludeExternal, maxSteps: 12 }),
+      const res = await ssePost("/agent/run", {
+        task: agentTask.trim(), novelId, includeExternal: agentIncludeExternal, maxSteps: 12,
+      }, () => {}, { failMessage: `HTTP 请求失败` });
+      await readSseEvents(res, (_name, payload) => {
+        // 服务端用 event: 字段区分事件类型，payload 里也带 type 兜底
+        const ev = payload?.type || _name;
+        if (ev === "assistant_text") setAgentLog((l) => [...l, { kind: "text", text: payload.text, step: payload.step }]);
+        else if (ev === "tool_call") setAgentLog((l) => [...l, { kind: "tool_call", name: payload.name, args: payload.args, step: payload.step }]);
+        else if (ev === "tool_result") setAgentLog((l) => [...l, { kind: "tool_result", name: payload.name, preview: payload.preview, step: payload.step }]);
+        else if (ev === "done") {
+          setAgentLog((l) => [...l, { kind: "done", text: payload.truncated ? "已达到步数上限" : "已完成" }]);
+          void load(); // 自动刷新章节列表与正文，让 Agent 修改即时可见
+        } else if (ev === "tool_error") setAgentLog((l) => [...l, { kind: "tool_error", name: payload.name, error: payload.error, severity: payload.severity }]);
+        else if (ev === "error") setAgentLog((l) => [...l, { kind: "error", error: payload.error, severity: payload.severity }]);
+        return false;
       });
-      if (!res.ok) {
-        const errText = await res.text();
-        setAgentLog([{ kind: "error", error: errText || `HTTP ${res.status}` }]);
-        setAgentBusy(false);
-        return;
-      }
-      const reader = res.body!.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
-        const events = buf.split("\n\n");
-        buf = events.pop() ?? "";
-        for (const e of events) {
-          const lines = e.split("\n");
-          let ev = "", data = "";
-          for (const ln of lines) {
-            if (ln.startsWith("event:")) ev = ln.slice(6).trim();
-            else if (ln.startsWith("data:")) data += ln.slice(5).trim();
-          }
-          if (!ev || !data) continue;
-          try {
-            const payload = JSON.parse(data);
-            if (ev === "assistant_text") setAgentLog((l) => [...l, { kind: "text", text: payload.text, step: payload.step }]);
-            else if (ev === "tool_call") setAgentLog((l) => [...l, { kind: "tool_call", name: payload.name, args: payload.args, step: payload.step }]);
-            else if (ev === "tool_result") setAgentLog((l) => [...l, { kind: "tool_result", name: payload.name, preview: payload.preview, step: payload.step }]);
-            else if (ev === "done") {
-              setAgentLog((l) => [...l, { kind: "done", text: payload.truncated ? "已达到步数上限" : "已完成" }]);
-              void load(); // 自动刷新章节列表与正文，让 Agent 修改即时可见
-            }
-            else if (ev === "tool_error") setAgentLog((l) => [...l, { kind: "tool_error", name: payload.name, error: payload.error, severity: payload.severity }]);
-            else if (ev === "error") setAgentLog((l) => [...l, { kind: "error", error: payload.error, severity: payload.severity }]);
-          } catch { /* ignore */ }
-        }
-      }
     } catch (err: any) {
       setAgentLog((l) => [...l, { kind: "error", error: err?.message || String(err) }]);
     } finally {
