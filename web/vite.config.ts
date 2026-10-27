@@ -17,14 +17,5 @@ export default defineConfig({
     outDir: "dist",
     sourcemap: false,
     chunkSizeWarningLimit: 600,
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          // 绘图与编辑器等重依赖单独分包，改善缓存
-          konva: ["konva", "react-konva"],
-          codemirror: ["@uiw/react-codemirror", "@codemirror/lang-markdown", "@codemirror/theme-one-dark"],
-        },
-      },
-    },
   },
 });
