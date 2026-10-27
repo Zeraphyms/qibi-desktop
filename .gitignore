@@ -41,6 +41,8 @@ skills/**/runs/
 skills/distilled-author/workspace/
 skills/distilled-author/runs/
 
+*.tsbuildinfo
+
 # IDE, agent & Editor caches
 .claude/
 .codex/
