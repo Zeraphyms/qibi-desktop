@@ -341,13 +341,39 @@ function buildContext(req: Request): string {
   return parts.join("\n\n");
 }
 
-function resolveKey(req: Request, user: any): { key: string | null; source: string } {
+// ---- 各 AI 场景（writer/distill/world/agent）密钥与运行时配置的统一解析 ----
+// scope 决定会话字段名、用户库字段名与默认回退链：
+// - writer:  ai_api_*    （无回退）
+// - distill: distill_api_*（无回退）
+// - world / agent: 各自专属字段，未配置时优雅回退到 writer（小说写作助手）配置，再回退站方
+type AiScope = "writer" | "distill" | "world" | "agent";
+
+type ResolvedKey = { key: string | null; source: string };
+
+const SCOPE_FIELD: Record<AiScope, { session: string; column: string }> = {
+  writer: { session: "userApiKey", column: "ai_api" },
+  distill: { session: "distillApiKey", column: "distill_api" },
+  world: { session: "worldApiKey", column: "world_api" },
+  agent: { session: "agentApiKey", column: "agent_api" },
+};
+
+// 从 body → session → 用户库 → （可选回退 writer）→ 站方，按优先级解析出一个可用密钥
+function resolveScopedKey(req: Request, user: any, scope: AiScope, opts?: { fallbackToWriter?: boolean }): ResolvedKey {
+  const field = SCOPE_FIELD[scope];
+  const session = req.session as any;
   const bodyKey = req.body?.apiKey;
   if (bodyKey && typeof bodyKey === "string" && bodyKey.trim()) return { key: bodyKey.trim(), source: "body" };
-  if (req.session.userApiKey) return { key: req.session.userApiKey, source: "session" };
-  if (user.ai_api_key_enabled && user.ai_api_key_enc) {
-    const dec = decryptKey(user.ai_api_key_enc, process.env.SESSION_SECRET || "x");
+  if (session[field.session]) return { key: session[field.session], source: "session" };
+  if (user[`${field.column}_key_enabled`] && user[`${field.column}_key_enc`]) {
+    const dec = decryptKey(user[`${field.column}_key_enc`], process.env.SESSION_SECRET || "x");
     if (dec) return { key: dec, source: "user-db" };
+  }
+  if (opts?.fallbackToWriter) {
+    if (req.session.userApiKey) return { key: req.session.userApiKey, source: "writer-session" };
+    if (user.ai_api_key_enabled && user.ai_api_key_enc) {
+      const dec = decryptKey(user.ai_api_key_enc, process.env.SESSION_SECRET || "x");
+      if (dec) return { key: dec, source: "writer-db" };
+    }
   }
   const station = getStationKey(user);
   if (station) return { key: station, source: "station" };
@@ -362,148 +388,44 @@ export type AiRuntimeConfig = {
   model: string;
 };
 
-
-// 解析蒸馏请求中的密钥
-function resolveDistillKey(req: Request, user: any): { key: string | null; source: string } {
-  const bodyKey = req.body?.apiKey;
-  if (bodyKey && typeof bodyKey === "string" && bodyKey.trim()) return { key: bodyKey.trim(), source: "body" };
-  if (req.session.distillApiKey) return { key: req.session.distillApiKey, source: "session" };
-  if (user.distill_api_key_enabled && user.distill_api_key_enc) {
-    const dec = decryptKey(user.distill_api_key_enc, process.env.SESSION_SECRET || "x");
-    if (dec) return { key: dec, source: "user-db" };
-  }
-  const station = getStationKey(user);
-  if (station) return { key: station, source: "station" };
-  return { key: null, source: "none" };
+// protocol=auto 时按 baseUrl 是否以 /v1 结尾推断协议；模型缺省按协议给出默认值
+function buildRuntimeConfig(key: string, source: AiRuntimeConfig["source"], baseUrl: string | null | undefined, protocol: string | undefined, model: string | null | undefined): AiRuntimeConfig {
+  const base = normalizeBaseUrl(baseUrl || "https://api.anthropic.com");
+  const resolvedProtocol = validProtocol(protocol) === "auto"
+    ? (base.endsWith("/v1") ? "openai" : "anthropic")
+    : (validProtocol(protocol) as "anthropic" | "openai");
+  const resolvedModel = String(model || "").trim() || (resolvedProtocol === "anthropic" ? "claude-opus-5" : MODEL);
+  return { key, source, baseUrl: base, protocol: resolvedProtocol, model: resolvedModel };
 }
 
-export function resolveDistillRuntimeConfig(req: Request, user: any): AiRuntimeConfig | null {
-  const resolved = resolveDistillKey(req, user);
-  if (!resolved.key) return null;
-  const isPersonal = resolved.source !== "station";
-  if (!isPersonal) {
-    const baseUrl = normalizeBaseUrl(BASE_URL || "https://api.anthropic.com");
-    const protocol = BASE_URL.endsWith("/v1") ? "openai" : "anthropic";
-    return { key: resolved.key, source: "station", baseUrl, protocol, model: MODEL };
-  }
-  const configuredBase = req.session.distillApiBaseUrl || user.distill_api_base_url;
-  const configuredProtocol = validProtocol(req.session.distillApiProtocol || user.distill_api_protocol);
-  const baseUrl = normalizeBaseUrl(configuredBase || "https://api.anthropic.com");
-  const protocol = configuredProtocol === "auto" ? (configuredBase?.endsWith("/v1") ? "openai" : "anthropic") : configuredProtocol;
-  const configuredModel = String(req.session.distillApiModel || user.distill_api_model || "").trim();
-  const model = configuredModel || (protocol === "anthropic" ? "claude-opus-5" : MODEL);
-  return { key: resolved.key, source: resolved.source as AiRuntimeConfig["source"], baseUrl, protocol, model };
-}
-
-// 解析设定库（角色与地图共用）密钥
-function resolveWorldKey(req: Request, user: any): { key: string | null; source: string } {
-  const bodyKey = req.body?.apiKey;
-  if (bodyKey && typeof bodyKey === "string" && bodyKey.trim()) return { key: bodyKey.trim(), source: "body" };
-  if (req.session.worldApiKey) return { key: req.session.worldApiKey, source: "session" };
-  if (user.world_api_key_enabled && user.world_api_key_enc) {
-    const dec = decryptKey(user.world_api_key_enc, process.env.SESSION_SECRET || "x");
-    if (dec) return { key: dec, source: "user-db" };
-  }
-  // 未单独配置时，优雅回退到小说写作助手配置或站方配置
-  if (req.session.userApiKey) return { key: req.session.userApiKey, source: "writer-session" };
-  if (user.ai_api_key_enabled && user.ai_api_key_enc) {
-    const dec = decryptKey(user.ai_api_key_enc, process.env.SESSION_SECRET || "x");
-    if (dec) return { key: dec, source: "writer-db" };
-  }
-  const station = getStationKey(user);
-  if (station) return { key: station, source: "station" };
-  return { key: null, source: "none" };
-}
-
-
-// 解析 Agent 专用配置
-function resolveAgentKey(req: Request, user: any): { key: string | null; source: string } {
-  const bodyKey = req.body?.apiKey;
-  if (bodyKey && typeof bodyKey === "string" && bodyKey.trim()) return { key: bodyKey.trim(), source: "body" };
-  if (req.session.agentApiKey) return { key: req.session.agentApiKey, source: "session" };
-  if (user.agent_api_key_enabled && user.agent_api_key_enc) {
-    const dec = decryptKey(user.agent_api_key_enc, process.env.SESSION_SECRET || "x");
-    if (dec) return { key: dec, source: "user-db" };
-  }
-  // 未单独配置时，回退到小说写作助手配置或站方配置
-  if (req.session.userApiKey) return { key: req.session.userApiKey, source: "writer-session" };
-  if (user.ai_api_key_enabled && user.ai_api_key_enc) {
-    const dec = decryptKey(user.ai_api_key_enc, process.env.SESSION_SECRET || "x");
-    if (dec) return { key: dec, source: "writer-db" };
-  }
-  const station = getStationKey(user);
-  if (station) return { key: station, source: "station" };
-  return { key: null, source: "none" };
-}
-
-export function resolveAgentRuntimeConfig(req: Request, user: any): AiRuntimeConfig | null {
-  const resolved = resolveAgentKey(req, user);
+// 依据密钥来源挑选配置来源：站方 → 站方默认；借用 writer 的 → writer 配置；其余 → 各 scope 自己的配置
+function scopedRuntimeConfig(resolved: ResolvedKey, req: Request, user: any, scope: AiScope, opts?: { fallbackToWriter?: boolean }): AiRuntimeConfig | null {
   if (!resolved.key) return null;
   if (resolved.source === "station") {
-    const baseUrl = normalizeBaseUrl(BASE_URL || "https://api.anthropic.com");
-    const protocol = BASE_URL.endsWith("/v1") ? "openai" : "anthropic";
-    return { key: resolved.key, source: "station", baseUrl, protocol, model: MODEL };
+    return buildRuntimeConfig(resolved.key, "station", BASE_URL || "https://api.anthropic.com", BASE_URL.endsWith("/v1") ? "openai" : "anthropic", MODEL);
   }
   if (resolved.source === "writer-session" || resolved.source === "writer-db") {
-    const configuredBase = req.session.userApiBaseUrl || user.ai_api_base_url;
-    const configuredProtocol = validProtocol(req.session.userApiProtocol || user.ai_api_protocol);
-    const baseUrl = normalizeBaseUrl(configuredBase || "https://api.anthropic.com");
-    const protocol = configuredProtocol === "auto" ? (configuredBase?.endsWith("/v1") ? "openai" : "anthropic") : configuredProtocol;
-    const configuredModel = String(req.session.userApiModel || user.ai_api_model || "").trim();
-    const model = configuredModel || (protocol === "anthropic" ? "claude-opus-5" : MODEL);
-    return { key: resolved.key, source: resolved.source === "writer-session" ? "session" : "user-db", baseUrl, protocol, model };
+    return buildRuntimeConfig(resolved.key, resolved.source === "writer-session" ? "session" : "user-db", req.session.userApiBaseUrl || user.ai_api_base_url, req.session.userApiProtocol || user.ai_api_protocol, req.session.userApiModel || user.ai_api_model);
   }
-  const configuredBase = req.session.agentApiBaseUrl || user.agent_api_base_url;
-  const configuredProtocol = validProtocol(req.session.agentApiProtocol || user.agent_api_protocol);
-  const baseUrl = normalizeBaseUrl(configuredBase || "https://api.anthropic.com");
-  const protocol = configuredProtocol === "auto" ? (configuredBase?.endsWith("/v1") ? "openai" : "anthropic") : configuredProtocol;
-  const configuredModel = String(req.session.agentApiModel || user.agent_api_model || "").trim();
-  const model = configuredModel || (protocol === "anthropic" ? "claude-opus-5" : MODEL);
-  return { key: resolved.key, source: resolved.source as AiRuntimeConfig["source"], baseUrl, protocol, model };
-}
-
-export function resolveWorldRuntimeConfig(req: Request, user: any): AiRuntimeConfig | null {
-  const resolved = resolveWorldKey(req, user);
-  if (!resolved.key) return null;
-  if (resolved.source === "station") {
-    const baseUrl = normalizeBaseUrl(BASE_URL || "https://api.anthropic.com");
-    const protocol = BASE_URL.endsWith("/v1") ? "openai" : "anthropic";
-    return { key: resolved.key, source: "station", baseUrl, protocol, model: MODEL };
-  }
-  if (resolved.source === "writer-session" || resolved.source === "writer-db") {
-    const configuredBase = req.session.userApiBaseUrl || user.ai_api_base_url;
-    const configuredProtocol = validProtocol(req.session.userApiProtocol || user.ai_api_protocol);
-    const baseUrl = normalizeBaseUrl(configuredBase || "https://api.anthropic.com");
-    const protocol = configuredProtocol === "auto" ? (configuredBase?.endsWith("/v1") ? "openai" : "anthropic") : configuredProtocol;
-    const configuredModel = String(req.session.userApiModel || user.ai_api_model || "").trim();
-    const model = configuredModel || (protocol === "anthropic" ? "claude-opus-5" : MODEL);
-    return { key: resolved.key, source: resolved.source === "writer-session" ? "session" : "user-db", baseUrl, protocol, model };
-  }
-  const configuredBase = req.session.worldApiBaseUrl || user.world_api_base_url;
-  const configuredProtocol = validProtocol(req.session.worldApiProtocol || user.world_api_protocol);
-  const baseUrl = normalizeBaseUrl(configuredBase || "https://api.anthropic.com");
-  const protocol = configuredProtocol === "auto" ? (configuredBase?.endsWith("/v1") ? "openai" : "anthropic") : configuredProtocol;
-  const configuredModel = String(req.session.worldApiModel || user.world_api_model || "").trim();
-  const model = configuredModel || (protocol === "anthropic" ? "claude-opus-5" : MODEL);
-  return { key: resolved.key, source: resolved.source as AiRuntimeConfig["source"], baseUrl, protocol, model };
+  const field = SCOPE_FIELD[scope];
+  const session = req.session as any;
+  return buildRuntimeConfig(resolved.key, resolved.source as AiRuntimeConfig["source"], session[`${field.session}BaseUrl`] || user[`${field.column}_base_url`], session[`${field.session}Protocol`] || user[`${field.column}_protocol`], session[`${field.session}Model`] || user[`${field.column}_model`]);
 }
 
 export function resolveRuntimeConfig(req: Request, user: any): AiRuntimeConfig | null {
-  const resolved = resolveKey(req, user);
-  if (!resolved.key) return null;
-  const isPersonal = resolved.source !== "station";
-  if (!isPersonal) {
-    const baseUrl = normalizeBaseUrl(BASE_URL || "https://api.anthropic.com");
-    const protocol = BASE_URL.endsWith("/v1") ? "openai" : "anthropic";
-    return { key: resolved.key, source: "station", baseUrl, protocol, model: MODEL };
-  }
-  const configuredBase = req.session.userApiBaseUrl || user.ai_api_base_url;
-  const configuredProtocol = validProtocol(req.session.userApiProtocol || user.ai_api_protocol);
-  const baseUrl = normalizeBaseUrl(configuredBase || "https://api.anthropic.com");
-  const protocol = configuredProtocol === "auto" ? (configuredBase?.endsWith("/v1") ? "openai" : "anthropic") : configuredProtocol;
-  const configuredModel = String(req.session.userApiModel || user.ai_api_model || "").trim();
-  const model = configuredModel || (protocol === "anthropic" ? "claude-opus-5" : MODEL);
-  return { key: resolved.key, source: resolved.source as AiRuntimeConfig["source"], baseUrl, protocol, model };
+  return scopedRuntimeConfig(resolveScopedKey(req, user, "writer"), req, user, "writer");
+}
+
+export function resolveDistillRuntimeConfig(req: Request, user: any): AiRuntimeConfig | null {
+  return scopedRuntimeConfig(resolveScopedKey(req, user, "distill"), req, user, "distill");
+}
+
+export function resolveWorldRuntimeConfig(req: Request, user: any): AiRuntimeConfig | null {
+  return scopedRuntimeConfig(resolveScopedKey(req, user, "world", { fallbackToWriter: true }), req, user, "world", { fallbackToWriter: true });
+}
+
+export function resolveAgentRuntimeConfig(req: Request, user: any): AiRuntimeConfig | null {
+  return scopedRuntimeConfig(resolveScopedKey(req, user, "agent", { fallbackToWriter: true }), req, user, "agent", { fallbackToWriter: true });
 }
 
 function ensureChapterAccess(req: Request, user: any): any {
@@ -1100,142 +1022,6 @@ router.get("/settings", (req, res) => {
 
 
 // 单独配置管家 Agent 专属 API Key 与端点
-router.post("/settings/agent-key", (req, res) => {
-  const user = currentUser(req);
-  if (!user) return res.status(401).json({ error: "请先登录" });
-  const { apiKey, mode, baseUrl, protocol, model } = req.body || {};
-  const station = getStationKey(user);
-
-  if (mode === "session") {
-    if (apiKey && String(apiKey).trim()) req.session.agentApiKey = String(apiKey).trim();
-    if (baseUrl !== undefined) req.session.agentApiBaseUrl = baseUrl ? normalizeBaseUrl(String(baseUrl)) : undefined;
-    if (protocol !== undefined) req.session.agentApiProtocol = validProtocol(protocol);
-    if (model !== undefined) req.session.agentApiModel = model ? String(model).trim() : undefined;
-    if (!req.session.agentApiKey && !user.agent_api_key_enabled && !station && !req.session.userApiKey && !user.ai_api_key_enabled) {
-      return res.status(400).json({ error: "请填写管家 Agent 专用 API Key" });
-    }
-    return res.json({ ok: true, source: req.session.agentApiKey ? "session" : (station ? "station" : "none") });
-  }
-  if (mode === "persist") {
-    const hasNewKey = apiKey && String(apiKey).trim();
-    if (!hasNewKey && !user.agent_api_key_enabled && !station && !req.session.userApiKey && !user.ai_api_key_enabled) {
-      return res.status(400).json({ error: "请填写管家 Agent 专用 API Key" });
-    }
-    const enc = (hasNewKey ? encryptKeyDb(String(apiKey).trim()) : user.agent_api_key_enc) ?? null;
-    const normalizedBase = (baseUrl === undefined ? user.agent_api_base_url : (baseUrl ? normalizeBaseUrl(String(baseUrl)) : null)) ?? null;
-    const normalizedProtocol = protocol === undefined ? validProtocol(user.agent_api_protocol) : validProtocol(protocol);
-    const normalizedModel = (model === undefined ? user.agent_api_model : (model ? String(model).trim() : null)) ?? null;
-    db.prepare("UPDATE users SET agent_api_key_enc = ?, agent_api_key_enabled = ?, agent_api_base_url = ?, agent_api_protocol = ?, agent_api_model = ? WHERE id = ?").run(
-      enc,
-      hasNewKey ? 1 : (user.agent_api_key_enabled ? 1 : 0),
-      normalizedBase,
-      normalizedProtocol,
-      normalizedModel,
-      user.id
-    );
-    return res.json({ ok: true, source: hasNewKey ? "user-db" : (user.agent_api_key_enabled ? "user-db" : (station ? "station" : "none")) });
-  }
-  if (mode === "clear") {
-    req.session.agentApiKey = undefined;
-    req.session.agentApiBaseUrl = undefined;
-    req.session.agentApiProtocol = undefined;
-    req.session.agentApiModel = undefined;
-    db.prepare("UPDATE users SET agent_api_key_enabled = 0, agent_api_key_enc = NULL, agent_api_base_url = NULL, agent_api_protocol = 'auto', agent_api_model = NULL WHERE id = ?").run(user.id);
-    return res.json({ ok: true, source: "none" });
-  }
-  return res.status(400).json({ error: "未知的 mode" });
-});
-
-router.post("/settings/world-key", (req, res) => {
-  const user = currentUser(req);
-  if (!user) return res.status(401).json({ error: "请先登录" });
-  const { apiKey, mode, baseUrl, protocol, model } = req.body || {};
-  const station = getStationKey(user);
-
-  if (mode === "session") {
-    if (apiKey && String(apiKey).trim()) req.session.worldApiKey = String(apiKey).trim();
-    if (baseUrl !== undefined) req.session.worldApiBaseUrl = baseUrl ? normalizeBaseUrl(String(baseUrl)) : undefined;
-    if (protocol !== undefined) req.session.worldApiProtocol = validProtocol(protocol);
-    if (model !== undefined) req.session.worldApiModel = model ? String(model).trim() : undefined;
-    if (!req.session.worldApiKey && !user.world_api_key_enabled && !station && !req.session.userApiKey && !user.ai_api_key_enabled) {
-      return res.status(400).json({ error: "请填写角色与地图专用 API Key" });
-    }
-    return res.json({ ok: true, source: req.session.worldApiKey ? "session" : (station ? "station" : "none") });
-  }
-  if (mode === "persist") {
-    const hasNewKey = apiKey && String(apiKey).trim();
-    if (!hasNewKey && !user.world_api_key_enabled && !station && !req.session.userApiKey && !user.ai_api_key_enabled) {
-      return res.status(400).json({ error: "请填写角色与地图专用 API Key" });
-    }
-    const enc = (hasNewKey ? encryptKeyDb(String(apiKey).trim()) : user.world_api_key_enc) ?? null;
-    const normalizedBase = (baseUrl === undefined ? user.world_api_base_url : (baseUrl ? normalizeBaseUrl(String(baseUrl)) : null)) ?? null;
-    const normalizedProtocol = protocol === undefined ? validProtocol(user.world_api_protocol) : validProtocol(protocol);
-    const normalizedModel = (model === undefined ? user.world_api_model : (model ? String(model).trim() : null)) ?? null;
-    db.prepare("UPDATE users SET world_api_key_enc = ?, world_api_key_enabled = ?, world_api_base_url = ?, world_api_protocol = ?, world_api_model = ? WHERE id = ?").run(
-      enc,
-      hasNewKey ? 1 : (user.world_api_key_enabled ? 1 : 0),
-      normalizedBase,
-      normalizedProtocol,
-      normalizedModel,
-      user.id
-    );
-    return res.json({ ok: true, source: hasNewKey ? "user-db" : (user.world_api_key_enabled ? "user-db" : (station ? "station" : "none")) });
-  }
-  if (mode === "clear") {
-    req.session.worldApiKey = undefined;
-    req.session.worldApiBaseUrl = undefined;
-    req.session.worldApiProtocol = undefined;
-    req.session.worldApiModel = undefined;
-    db.prepare("UPDATE users SET world_api_key_enabled = 0, world_api_key_enc = NULL, world_api_base_url = NULL, world_api_protocol = 'auto', world_api_model = NULL WHERE id = ?").run(user.id);
-    return res.json({ ok: true, source: "none" });
-  }
-  res.status(400).json({ error: "未知模式" });
-});
-
-router.post("/settings/distill-key", (req, res) => {
-  const user = currentUser(req);
-  if (!user) return res.status(401).json({ error: "请先登录" });
-  const { apiKey, mode, baseUrl, protocol, model } = req.body || {};
-  const station = getStationKey(user);
-
-  if (mode === "session") {
-    if (apiKey && String(apiKey).trim()) req.session.distillApiKey = String(apiKey).trim();
-    if (baseUrl !== undefined) req.session.distillApiBaseUrl = baseUrl ? normalizeBaseUrl(String(baseUrl)) : undefined;
-    if (protocol !== undefined) req.session.distillApiProtocol = validProtocol(protocol);
-    if (model !== undefined) req.session.distillApiModel = model ? String(model).trim() : undefined;
-    if (!req.session.distillApiKey && !user.distill_api_key_enabled && !station) return res.status(400).json({ error: "请填写蒸馏专用 API Key" });
-    return res.json({ ok: true, source: req.session.distillApiKey ? "session" : (station ? "station" : "none") });
-  }
-  if (mode === "persist") {
-    const hasNewKey = apiKey && String(apiKey).trim();
-    if (!hasNewKey && !user.distill_api_key_enabled && !station) return res.status(400).json({ error: "请填写蒸馏专用 API Key" });
-    const enc = (hasNewKey ? encryptKeyDb(String(apiKey).trim()) : user.distill_api_key_enc) ?? null;
-    const normalizedBase = (baseUrl === undefined ? user.distill_api_base_url : (baseUrl ? normalizeBaseUrl(String(baseUrl)) : null)) ?? null;
-    const normalizedProtocol = protocol === undefined ? validProtocol(user.distill_api_protocol) : validProtocol(protocol);
-    const normalizedModel = (model === undefined ? user.distill_api_model : (model ? String(model).trim() : null)) ?? null;
-    db.prepare("UPDATE users SET distill_api_key_enc = ?, distill_api_key_enabled = ?, distill_api_base_url = ?, distill_api_protocol = ?, distill_api_model = ? WHERE id = ?").run(
-      enc,
-      hasNewKey ? 1 : (user.distill_api_key_enabled ? 1 : 0),
-      normalizedBase,
-      normalizedProtocol,
-      normalizedModel,
-      user.id
-    );
-    return res.json({ ok: true, source: hasNewKey ? "user-db" : (user.distill_api_key_enabled ? "user-db" : (station ? "station" : "none")) });
-  }
-  if (mode === "clear") {
-    req.session.distillApiKey = undefined;
-    req.session.distillApiBaseUrl = undefined;
-    req.session.distillApiProtocol = undefined;
-    req.session.distillApiModel = undefined;
-    db.prepare("UPDATE users SET distill_api_key_enabled = 0, distill_api_key_enc = NULL, distill_api_base_url = NULL, distill_api_protocol = 'auto', distill_api_model = NULL WHERE id = ?").run(user.id);
-    return res.json({ ok: true, source: "none" });
-  }
-  res.status(400).json({ error: "未知模式" });
-});
-
-
-// 测试自定义 API 端点的 Tool-Calling (Function Calling) 兼容性
 router.post("/test-tools", async (req, res) => {
   const user = currentUser(req);
   if (!user) return res.status(401).json({ error: "请先登录" });
@@ -1311,41 +1097,65 @@ router.post("/test-tools", async (req, res) => {
   }
 });
 
-router.post("/settings/ai-key", (req, res) => {
-  const user = currentUser(req);
-  if (!user) return res.status(401).json({ error: "请先登录" });
-  const { apiKey, mode, baseUrl, protocol, model } = req.body || {};
-  const station = getStationKey(user);
+// ---- 各 scope（ai/writer、agent、world、distill）共用的密钥设置端点工厂 ----
+// session: 只写会话; persist: AES-GCM 加密落库; clear: 双清。差异仅字段前缀与文案。
+function makeKeySettingsHandler(scope: AiScope, label: string, opts?: { fallbackToWriter?: boolean }) {
+  const field = SCOPE_FIELD[scope];
+  return (req: Request, res: Response) => {
+    const user = currentUser(req) as any;
+    if (!user) return res.status(401).json({ error: "请先登录" });
+    const session = req.session as any;
+    const { apiKey, mode, baseUrl, protocol, model } = req.body || {};
+    const station = getStationKey(user);
+    const writerConfigured = Boolean(req.session.userApiKey || (user.ai_api_key_enabled && user.ai_api_key_enc));
+    const ownSession = session[field.session];
+    const ownEnabled = Boolean(user[`${field.column}_key_enabled`] && user[`${field.column}_key_enc`]);
 
-  if (mode === "session") {
-    if (apiKey && String(apiKey).trim()) req.session.userApiKey = String(apiKey).trim();
-    if (baseUrl !== undefined) req.session.userApiBaseUrl = baseUrl ? normalizeBaseUrl(String(baseUrl)) : undefined;
-    if (protocol !== undefined) req.session.userApiProtocol = validProtocol(protocol);
-    if (model !== undefined) req.session.userApiModel = model ? String(model).trim() : undefined;
-    if (!req.session.userApiKey && !user.ai_api_key_enabled && !station) return res.status(400).json({ error: "请填写 API Key" });
-    return res.json({ ok: true, source: req.session.userApiKey ? "session" : (station ? "station" : "none") });
-  }
-  if (mode === "persist") {
-    const hasNewKey = apiKey && String(apiKey).trim();
-    if (!hasNewKey && !user.ai_api_key_enabled && !station) return res.status(400).json({ error: "请填写 API Key" });
-    const enc = (hasNewKey ? encryptKeyDb(String(apiKey).trim()) : user.ai_api_key_enc) ?? null;
-    const normalizedBase = (baseUrl === undefined ? user.ai_api_base_url : (baseUrl ? normalizeBaseUrl(String(baseUrl)) : null)) ?? null;
-    const normalizedProtocol = protocol === undefined ? validProtocol(user.ai_api_protocol) : validProtocol(protocol);
-    const normalizedModel = (model === undefined ? user.ai_api_model : (model ? String(model).trim() : null)) ?? null;
-    db.prepare("UPDATE users SET ai_api_key_enc = ?, ai_api_key_enabled = ?, ai_api_base_url = ?, ai_api_protocol = ?, ai_api_model = ? WHERE id = ?").run(enc, hasNewKey ? 1 : (user.ai_api_key_enabled ? 1 : 0), normalizedBase, normalizedProtocol, normalizedModel, user.id);
-    return res.json({ ok: true, source: hasNewKey ? "user-db" : (user.ai_api_key_enabled ? "user-db" : (station ? "station" : "none")) });
-  }
-  if (mode === "clear") {
-    req.session.userApiKey = undefined;
-    req.session.userApiBaseUrl = undefined;
-    req.session.userApiProtocol = undefined;
-    req.session.userApiModel = undefined;
-    db.prepare("UPDATE users SET ai_api_key_enabled = 0, ai_api_key_enc = NULL, ai_api_base_url = NULL, ai_api_protocol = 'auto', ai_api_model = NULL WHERE id = ?").run(user.id);
-    return res.json({ ok: true, source: "none" });
-  }
-  res.status(400).json({ error: "未知模式" });
-});
+    if (mode === "session") {
+      if (apiKey && String(apiKey).trim()) session[field.session] = String(apiKey).trim();
+      if (baseUrl !== undefined) session[`${field.session}BaseUrl`] = baseUrl ? normalizeBaseUrl(String(baseUrl)) : undefined;
+      if (protocol !== undefined) session[`${field.session}Protocol`] = validProtocol(protocol);
+      if (model !== undefined) session[`${field.session}Model`] = model ? String(model).trim() : undefined;
+      const usable = Boolean(session[field.session] || ownEnabled || station || (opts?.fallbackToWriter && writerConfigured));
+      if (!usable) return res.status(400).json({ error: `请填写${label ? label + "专用 " : ""}API Key` });
+      return res.json({ ok: true, source: session[field.session] ? "session" : (station ? "station" : "none") });
+    }
+    if (mode === "persist") {
+      const hasNewKey = apiKey && String(apiKey).trim();
+      const usable = Boolean(hasNewKey || ownEnabled || station || (opts?.fallbackToWriter && writerConfigured));
+      if (!usable) return res.status(400).json({ error: `请填写${label ? label + "专用 " : ""}API Key` });
+      const enc = (hasNewKey ? encryptKeyDb(String(apiKey).trim()) : user[`${field.column}_key_enc`]) ?? null;
+      const normalizedBase = (baseUrl === undefined ? user[`${field.column}_base_url`] : (baseUrl ? normalizeBaseUrl(String(baseUrl)) : null)) ?? null;
+      const normalizedProtocol = protocol === undefined ? validProtocol(user[`${field.column}_protocol`]) : validProtocol(protocol);
+      const normalizedModel = (model === undefined ? user[`${field.column}_model`] : (model ? String(model).trim() : null)) ?? null;
+      db.prepare(
+        `UPDATE users SET ${field.column}_key_enc = ?, ${field.column}_key_enabled = ?, ${field.column}_base_url = ?, ${field.column}_protocol = ?, ${field.column}_model = ? WHERE id = ?`
+      ).run(
+        enc,
+        hasNewKey ? 1 : (user[`${field.column}_key_enabled`] ? 1 : 0),
+        normalizedBase,
+        normalizedProtocol,
+        normalizedModel,
+        user.id
+      );
+      return res.json({ ok: true, source: hasNewKey ? "user-db" : (user[`${field.column}_key_enabled`] ? "user-db" : (station ? "station" : "none")) });
+    }
+    if (mode === "clear") {
+      session[field.session] = undefined;
+      session[`${field.session}BaseUrl`] = undefined;
+      session[`${field.session}Protocol`] = undefined;
+      session[`${field.session}Model`] = undefined;
+      db.prepare(`UPDATE users SET ${field.column}_key_enabled = 0, ${field.column}_key_enc = NULL, ${field.column}_base_url = NULL, ${field.column}_protocol = 'auto', ${field.column}_model = NULL WHERE id = ?`).run(user.id);
+      return res.json({ ok: true, source: "none" });
+    }
+    res.status(400).json({ error: "未知的 mode" });
+  };
+}
 
+router.post("/settings/ai-key", makeKeySettingsHandler("writer", "", { fallbackToWriter: false }));
+router.post("/settings/agent-key", makeKeySettingsHandler("agent", "管家 Agent", { fallbackToWriter: true }));
+router.post("/settings/world-key", makeKeySettingsHandler("world", "角色与地图", { fallbackToWriter: true }));
+router.post("/settings/distill-key", makeKeySettingsHandler("distill", "蒸馏", { fallbackToWriter: false }));
 // 用户密钥 AES-GCM 落库加密
 function encryptKeyDb(plain: string): string {
   return encryptKey(plain, process.env.SESSION_SECRET || "x");
